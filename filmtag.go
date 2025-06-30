@@ -9,7 +9,9 @@ import (
 	"strings"
 
 	"github.com/AlecAivazis/survey/v2"
+	"github.com/ktr0731/go-fuzzyfinder"
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 )
 
 // Data structures
@@ -42,12 +44,85 @@ type FilmStock struct {
 }
 
 type CLIFlags struct {
-	Camera    string
-	Lens      string
-	Film      string
-	FilePath  string
-	Clean     bool
-	Verbose   bool
+	Camera   string
+	Lens     string
+	Film     string
+	FilePath string
+	Clean    bool
+	Verbose  bool
+}
+
+// YAML config structures
+
+type GearConfig struct {
+	Cameras    map[string]Camera `yaml:"cameras"`
+	FilmStocks []FilmStock       `yaml:"filmstocks"`
+}
+
+// Global gear config
+var gearConfig GearConfig
+
+// Path to gear.yaml in user config dir
+func getGearConfigPath() (string, error) {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	gearDir := filepath.Join(configDir, "filmtag")
+	if _, err := os.Stat(gearDir); os.IsNotExist(err) {
+		err = os.MkdirAll(gearDir, 0755)
+		if err != nil {
+			return "", err
+		}
+	}
+	return filepath.Join(gearDir, "gear.yaml"), nil
+}
+
+// Load gear config from YAML
+func loadGearConfig() (GearConfig, error) {
+	path, err := getGearConfigPath()
+	if err != nil {
+		return GearConfig{}, err
+	}
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		// Write default config
+		defaultConfig := GearConfig{
+			Cameras:    cameras,
+			FilmStocks: filmStocks,
+		}
+		data, err := yaml.Marshal(defaultConfig)
+		if err != nil {
+			return GearConfig{}, err
+		}
+		err = os.WriteFile(path, data, 0644)
+		if err != nil {
+			return GearConfig{}, err
+		}
+		return defaultConfig, nil
+	}
+	// Load from file
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return GearConfig{}, err
+	}
+	var config GearConfig
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return GearConfig{}, err
+	}
+	return config, nil
+}
+
+// Save gear config to YAML
+func saveGearConfig(config GearConfig) error {
+	path, err := getGearConfigPath()
+	if err != nil {
+		return err
+	}
+	data, err := yaml.Marshal(config)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
 }
 
 // Predefined camera database
@@ -118,12 +193,12 @@ func validateEnvironment() error {
 	if _, err := exec.LookPath("exiftool"); err != nil {
 		return fmt.Errorf("exiftool not found in PATH. Install from https://exiftool.org")
 	}
-	
+
 	cmd := exec.Command("exiftool", "-ver")
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("exiftool test failed: %w", err)
 	}
-	
+
 	return nil
 }
 
@@ -168,11 +243,8 @@ func executeExifTool(args ...string) error {
 
 func stripScannerMetadata(files []string) error {
 	args := []string{
-		"-fnumber=",
-		"-shutterspeed=",
-		"-iso=",
-		"-make=",
-		"-model=",
+		"-all=",
+		"-tagsfromfile", "@", "-icc_profile",
 		"-overwrite_original",
 		"-P",
 	}
@@ -199,124 +271,114 @@ func applyFilmMetadata(camera Camera, lens Lens, film FilmStock, files []string)
 // Interactive flow functions
 func selectCamera() (Camera, error) {
 	fmt.Println("🎞️  Film Metadata Tool")
-	
-	options := []string{}
-	keys := []string{}
-	for k, v := range cameras {
-		if v.Type == Fixed {
-			options = append(options, fmt.Sprintf("%s (%s)", k, v.FixedLens.Name))
-		} else if v.Type == MediumFormat {
-			options = append(options, fmt.Sprintf("%s (interchangeable - 120 film)", k))
-		} else {
-			options = append(options, fmt.Sprintf("%s (interchangeable)", k))
-		}
-		keys = append(keys, k)
-	}
-	options = append(options, "Other (manual entry)")
-	keys = append(keys, "")
 
-	var selectedIndex int
-	prompt := &survey.Select{
-		Message: "📷 Select Camera:",
-		Options: options,
+	cameraList := make([]Camera, 0, len(gearConfig.Cameras))
+	cameraKeys := make([]string, 0, len(gearConfig.Cameras))
+	for k, v := range gearConfig.Cameras {
+		cameraList = append(cameraList, v)
+		cameraKeys = append(cameraKeys, k)
 	}
-	if err := survey.AskOne(prompt, &selectedIndex); err != nil {
+	// Add manual entry option
+	manualEntry := Camera{Make: "", Model: "", Type: Fixed}
+	cameraList = append(cameraList, manualEntry)
+
+	idx, err := fuzzyfinder.Find(
+		cameraList,
+		func(i int) string {
+			c := cameraList[i]
+			if c.Make == "" && c.Model == "" {
+				return "Other (manual entry)"
+			}
+			if c.Type == Fixed && c.FixedLens != nil {
+				return fmt.Sprintf("%s %s (%s)", c.Make, c.Model, c.FixedLens.Name)
+			} else if c.Type == MediumFormat {
+				return fmt.Sprintf("%s %s (interchangeable - 120 film)", c.Make, c.Model)
+			} else {
+				return fmt.Sprintf("%s %s (interchangeable)", c.Make, c.Model)
+			}
+		},
+		fuzzyfinder.WithPromptString("📷 Select Camera: "),
+	)
+	if err != nil {
 		return Camera{}, err
 	}
-	
-	if selectedIndex < len(cameras) {
-		return cameras[keys[selectedIndex]], nil
+	if idx == len(cameraList)-1 {
+		// Manual entry
+		var make, model string
+		makePrompt := &survey.Input{Message: "📝 Enter camera make:"}
+		if err := survey.AskOne(makePrompt, &make); err != nil {
+			return Camera{}, err
+		}
+		modelPrompt := &survey.Input{Message: "📝 Enter camera model:"}
+		if err := survey.AskOne(modelPrompt, &model); err != nil {
+			return Camera{}, err
+		}
+		newCamera := Camera{Make: make, Model: model, Type: Fixed}
+		gearConfig.Cameras[model] = newCamera
+		saveGearConfig(gearConfig)
+		return newCamera, nil
 	}
-	
-	// Manual camera entry
-	var make, model string
-	
-	makePrompt := &survey.Input{
-		Message: "📝 Enter camera make:",
-	}
-	if err := survey.AskOne(makePrompt, &make); err != nil {
-		return Camera{}, err
-	}
-	
-	modelPrompt := &survey.Input{
-		Message: "📝 Enter camera model:",
-	}
-	if err := survey.AskOne(modelPrompt, &model); err != nil {
-		return Camera{}, err
-	}
-	
-	return Camera{
-		Make:  make,
-		Model: model,
-		Type:  Fixed, // Assume fixed lens for manual entry
-	}, nil
+	return cameraList[idx], nil
 }
 
 func selectLens(camera Camera) (Lens, error) {
-	if camera.Type == Fixed {
+	if camera.Type == Fixed && camera.FixedLens != nil {
 		return *camera.FixedLens, nil
 	}
-	
-	options := []string{}
-	for _, lens := range camera.CompatibleLenses {
-		options = append(options, lens.Name)
-	}
-	options = append(options, "Add new lens", "Manual entry")
-	
-	var selectedIndex int
-	prompt := &survey.Select{
-		Message: fmt.Sprintf("🔍 Select Lens for %s:", camera.Model),
-		Options: options,
-	}
-	if err := survey.AskOne(prompt, &selectedIndex); err != nil {
-		return Lens{}, err
-	}
-	
-	if selectedIndex < len(camera.CompatibleLenses) {
-		return camera.CompatibleLenses[selectedIndex], nil
-	}
-	
-	// Manual lens entry
-	var lensName string
-	
-	namePrompt := &survey.Input{
-		Message: "📝 Enter lens name:",
-	}
-	if err := survey.AskOne(namePrompt, &lensName); err != nil {
-		return Lens{}, err
-	}
-	
-	focalPrompt := &survey.Input{
-		Message: "📝 Enter focal length (mm):",
-	}
-	var focalStr string
-	if err := survey.AskOne(focalPrompt, &focalStr); err != nil {
-		return Lens{}, err
-	}
-	
-	focalLength, err := strconv.Atoi(focalStr)
+	lenses := camera.CompatibleLenses
+	manualLens := Lens{Name: "", FocalLength: 0, MaxAperture: 0}
+	lenses = append(lenses, manualLens)
+	idx, err := fuzzyfinder.Find(
+		lenses,
+		func(i int) string {
+			l := lenses[i]
+			if l.Name == "" {
+				return "Manual entry"
+			}
+			return fmt.Sprintf("%s (%dmm f/%.1f)", l.Name, l.FocalLength, l.MaxAperture)
+		},
+		fuzzyfinder.WithPromptString(fmt.Sprintf("🔍 Select Lens for %s: ", camera.Model)),
+	)
 	if err != nil {
-		return Lens{}, fmt.Errorf("invalid focal length: %s", focalStr)
-	}
-	
-	aperturePrompt := &survey.Input{
-		Message: "📝 Enter max aperture (f-number):",
-	}
-	var apertureStr string
-	if err := survey.AskOne(aperturePrompt, &apertureStr); err != nil {
 		return Lens{}, err
 	}
-	
-	maxAperture, err := strconv.ParseFloat(apertureStr, 64)
-	if err != nil {
-		return Lens{}, fmt.Errorf("invalid aperture: %s", apertureStr)
+	if idx == len(lenses)-1 {
+		// Manual entry
+		var lensName string
+		namePrompt := &survey.Input{Message: "📝 Enter lens name:"}
+		if err := survey.AskOne(namePrompt, &lensName); err != nil {
+			return Lens{}, err
+		}
+		focalPrompt := &survey.Input{Message: "📝 Enter focal length (mm):"}
+		var focalStr string
+		if err := survey.AskOne(focalPrompt, &focalStr); err != nil {
+			return Lens{}, err
+		}
+		focalLength, err := strconv.Atoi(focalStr)
+		if err != nil {
+			return Lens{}, fmt.Errorf("invalid focal length: %s", focalStr)
+		}
+		aperturePrompt := &survey.Input{Message: "📝 Enter max aperture (f-number):"}
+		var apertureStr string
+		if err := survey.AskOne(aperturePrompt, &apertureStr); err != nil {
+			return Lens{}, err
+		}
+		maxAperture, err := strconv.ParseFloat(apertureStr, 64)
+		if err != nil {
+			return Lens{}, fmt.Errorf("invalid aperture: %s", apertureStr)
+		}
+		newLens := Lens{Name: lensName, FocalLength: focalLength, MaxAperture: maxAperture}
+		for k, v := range gearConfig.Cameras {
+			if v.Model == camera.Model {
+				v.CompatibleLenses = append(v.CompatibleLenses, newLens)
+				gearConfig.Cameras[k] = v
+				break
+			}
+		}
+		saveGearConfig(gearConfig)
+		return newLens, nil
 	}
-	
-	return Lens{
-		Name:        lensName,
-		FocalLength: focalLength,
-		MaxAperture: maxAperture,
-	}, nil
+	return lenses[idx], nil
 }
 
 func selectFilmStock(camera Camera) (FilmStock, error) {
@@ -324,62 +386,50 @@ func selectFilmStock(camera Camera) (FilmStock, error) {
 	if camera.Type == MediumFormat {
 		format = "120"
 	}
-	
-	options := []string{}
 	filtered := []FilmStock{}
-	for _, film := range filmStocks {
+	for _, film := range gearConfig.FilmStocks {
 		if film.Format == format {
-			if format == "120" {
-				options = append(options, fmt.Sprintf("%s (%s)", film.Name, format))
-			} else {
-				options = append(options, film.Name)
-			}
 			filtered = append(filtered, film)
 		}
 	}
-	options = append(options, "Other (manual entry)")
-	
-	var selectedIndex int
-	prompt := &survey.Select{
-		Message: "🎬 Select Film Stock:",
-		Options: options,
-	}
-	if err := survey.AskOne(prompt, &selectedIndex); err != nil {
-		return FilmStock{}, err
-	}
-	
-	if selectedIndex < len(filtered) {
-		return filtered[selectedIndex], nil
-	}
-	
-	// Manual film entry
-	var filmName string
-	
-	namePrompt := &survey.Input{
-		Message: "📝 Enter film name:",
-	}
-	if err := survey.AskOne(namePrompt, &filmName); err != nil {
-		return FilmStock{}, err
-	}
-	
-	isoPrompt := &survey.Input{
-		Message: "📝 Enter ISO speed:",
-	}
-	var isoStr string
-	if err := survey.AskOne(isoPrompt, &isoStr); err != nil {
-		return FilmStock{}, err
-	}
-	
-	filmISO, err := strconv.Atoi(isoStr)
+	manualFilm := FilmStock{Name: "", ISO: 0, Format: format}
+	filtered = append(filtered, manualFilm)
+	idx, err := fuzzyfinder.Find(
+		filtered,
+		func(i int) string {
+			f := filtered[i]
+			if f.Name == "" {
+				return "Manual entry"
+			}
+			return fmt.Sprintf("%s (ISO %d, %s)", f.Name, f.ISO, f.Format)
+		},
+		fuzzyfinder.WithPromptString("🎬 Select Film Stock: "),
+	)
 	if err != nil {
-		return FilmStock{}, fmt.Errorf("invalid ISO value: %s", isoStr)
+		return FilmStock{}, err
 	}
-	
-	return FilmStock{
-		Name:   filmName,
-		ISO:    filmISO,
-		Format: format,
-	}, nil
+	if idx == len(filtered)-1 {
+		// Manual entry
+		var filmName string
+		namePrompt := &survey.Input{Message: "📝 Enter film name:"}
+		if err := survey.AskOne(namePrompt, &filmName); err != nil {
+			return FilmStock{}, err
+		}
+		isoPrompt := &survey.Input{Message: "📝 Enter ISO speed:"}
+		var isoStr string
+		if err := survey.AskOne(isoPrompt, &isoStr); err != nil {
+			return FilmStock{}, err
+		}
+		filmISO, err := strconv.Atoi(isoStr)
+		if err != nil {
+			return FilmStock{}, fmt.Errorf("invalid ISO value: %s", isoStr)
+		}
+		newFilm := FilmStock{Name: filmName, ISO: filmISO, Format: format}
+		gearConfig.FilmStocks = append(gearConfig.FilmStocks, newFilm)
+		saveGearConfig(gearConfig)
+		return newFilm, nil
+	}
+	return filtered[idx], nil
 }
 
 func confirmConfiguration(camera Camera, lens Lens, film FilmStock, fileCount int) (bool, error) {
@@ -387,13 +437,13 @@ func confirmConfiguration(camera Camera, lens Lens, film FilmStock, fileCount in
 	if film.Format == "120" {
 		filmDisplay = fmt.Sprintf("%s (%s)", film.Name, film.Format)
 	}
-	
+
 	fmt.Printf("\n✅ Configuration:\n")
 	fmt.Printf("   Camera: %s %s\n", camera.Make, camera.Model)
 	fmt.Printf("   Lens: %s (%dmm f/%.1f)\n", lens.Name, lens.FocalLength, lens.MaxAperture)
 	fmt.Printf("   Film: %s (ISO %d)\n", filmDisplay, film.ISO)
 	fmt.Printf("   Files: %d JPEGs\n\n", fileCount)
-	
+
 	var confirm bool
 	prompt := &survey.Confirm{
 		Message: "⚠️  This will strip scanner EXIF data and add film camera metadata. Continue?",
@@ -417,7 +467,7 @@ func findLensByName(camera Camera, name string) (Lens, error) {
 	if camera.Type == Fixed {
 		return *camera.FixedLens, nil
 	}
-	
+
 	for _, lens := range camera.CompatibleLenses {
 		if lens.Name == name {
 			return lens, nil
@@ -444,24 +494,24 @@ func runInteractiveMode(path string) error {
 	if len(files) == 0 {
 		return fmt.Errorf("no JPEG files found in %s", path)
 	}
-	
+
 	fmt.Printf("📁 Found %d JPEG files in %s\n\n", len(files), path)
-	
+
 	camera, err := selectCamera()
 	if err != nil {
 		return err
 	}
-	
+
 	lens, err := selectLens(camera)
 	if err != nil {
 		return err
 	}
-	
+
 	film, err := selectFilmStock(camera)
 	if err != nil {
 		return err
 	}
-	
+
 	confirmed, err := confirmConfiguration(camera, lens, film, len(files))
 	if err != nil {
 		return err
@@ -470,14 +520,14 @@ func runInteractiveMode(path string) error {
 		fmt.Println("Operation cancelled.")
 		return nil
 	}
-	
+
 	return processFiles(files, camera, lens, film)
 }
 
 func runFlagMode(flags CLIFlags, path string) error {
 	files := []string{}
 	var err error
-	
+
 	if flags.FilePath != "" {
 		files = []string{flags.FilePath}
 	} else {
@@ -486,34 +536,34 @@ func runFlagMode(flags CLIFlags, path string) error {
 			return err
 		}
 	}
-	
+
 	if len(files) == 0 {
 		return fmt.Errorf("no JPEG files found")
 	}
-	
+
 	camera, err := findCameraByName(flags.Camera)
 	if err != nil {
 		return err
 	}
-	
+
 	lens, err := findLensByName(camera, flags.Lens)
 	if err != nil {
 		return err
 	}
-	
+
 	format := "35mm"
 	if camera.Type == MediumFormat {
 		format = "120"
 	}
-	
+
 	film, err := findFilmByName(flags.Film, format)
 	if err != nil {
 		return err
 	}
-	
+
 	fmt.Printf("🎞️  Film Metadata Tool\n")
 	fmt.Printf("📁 Found %d JPEG files\n\n", len(files))
-	
+
 	confirmed, err := confirmConfiguration(camera, lens, film, len(files))
 	if err != nil {
 		return err
@@ -522,7 +572,7 @@ func runFlagMode(flags CLIFlags, path string) error {
 		fmt.Println("Operation cancelled.")
 		return nil
 	}
-	
+
 	return processFiles(files, camera, lens, film)
 }
 
@@ -534,10 +584,10 @@ func runCleanMode(path string) error {
 	if len(files) == 0 {
 		return fmt.Errorf("no JPEG files found in %s", path)
 	}
-	
+
 	fmt.Printf("🧹 Clean Mode: Strip scanner EXIF data only\n")
 	fmt.Printf("📁 Found %d JPEG files in %s\n\n", len(files), path)
-	
+
 	var confirm bool
 	prompt := &survey.Confirm{
 		Message: "⚠️  This will remove scanner make/model, f-stop, shutter speed, and ISO. Continue?",
@@ -550,7 +600,7 @@ func runCleanMode(path string) error {
 		fmt.Println("Operation cancelled.")
 		return nil
 	}
-	
+
 	fmt.Println("🔄 Processing...")
 	if err := stripScannerMetadata(files); err != nil {
 		return err
@@ -563,7 +613,7 @@ func processFiles(files []string, camera Camera, lens Lens, film FilmStock) erro
 	if err := validateFiles(files); err != nil {
 		return err
 	}
-	
+
 	fmt.Println("🔄 Processing...")
 	if err := stripScannerMetadata(files); err != nil {
 		return fmt.Errorf("failed to strip metadata: %w", err)
@@ -580,9 +630,9 @@ func main() {
 		fmt.Printf("❌ Environment check failed: %v\n", err)
 		os.Exit(1)
 	}
-	
+
 	var flags CLIFlags
-	
+
 	var rootCmd = &cobra.Command{
 		Use:   "filmtag [directory]",
 		Short: "CLI tool to manage film photography metadata using ExifTool",
@@ -607,26 +657,26 @@ Examples:
 			if len(args) > 0 {
 				path = args[0]
 			}
-			
+
 			if flags.Clean {
 				return runCleanMode(path)
 			}
-			
+
 			if flags.Camera != "" {
 				return runFlagMode(flags, path)
 			}
-			
+
 			return runInteractiveMode(path)
 		},
 	}
-	
+
 	rootCmd.Flags().StringVarP(&flags.Camera, "camera", "c", "", "Camera name (e.g., 'Contax T3')")
 	rootCmd.Flags().StringVarP(&flags.Lens, "lens", "l", "", "Lens name (for interchangeable lens cameras)")
 	rootCmd.Flags().StringVar(&flags.Film, "film", "", "Film stock name (e.g., 'Kodak Portra 400')")
 	rootCmd.Flags().StringVarP(&flags.FilePath, "file", "f", "", "Process single file instead of directory")
 	rootCmd.Flags().BoolVar(&flags.Clean, "clean", false, "Strip scanner EXIF data only (no film metadata)")
 	rootCmd.Flags().BoolVarP(&flags.Verbose, "verbose", "v", false, "Verbose output")
-	
+
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Printf("❌ %v\n", err)
 		os.Exit(1)

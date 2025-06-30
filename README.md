@@ -14,23 +14,22 @@ FilmTag solves this by:
 
 ## Installation
 
+### One-Line Install (Recommended)
+
+Run this command in your terminal:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rohanpandula/filmtag/main/install.sh | bash
+```
+
+This will install filmtag and set up your PATH automatically. Restart your terminal or run `source ~/.zshrc` (or your shell's config file) if needed.
+
 ### Requirements
 - **[ExifTool](https://exiftool.org/)** must be installed and available in your system's PATH.
 - **macOS (via Homebrew):**
   ```bash
   brew install exiftool
   ```
-
-### Via Go (Recommended)
-```bash
-go install github.com/rohanpandula/filmtag@latest
-```
-
-### After installation, ensure `filmtag` is in your PATH:
-```bash
-echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> ~/.bashrc
-source ~/.bashrc
-```
 
 ## Usage
 
