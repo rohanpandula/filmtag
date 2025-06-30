@@ -23,7 +23,7 @@ FilmTag solves this by:
 
 ### Via Go (Recommended)
 ```bash
-go install [github.com/rohanpandula/filmtag@latest](https://github.com/rohanpandula/filmtag@latest)
+go install github.com/rohanpandula/filmtag@latest
 ```
 
 ### Via Homebrew (Coming Soon)
