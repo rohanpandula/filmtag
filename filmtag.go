@@ -24,23 +24,23 @@ const (
 )
 
 type Lens struct {
-	Name        string
-	FocalLength int
-	MaxAperture float64
+	Name        string  `yaml:"name"`
+	FocalLength int     `yaml:"focallength"`
+	MaxAperture float64 `yaml:"maxaperture"`
 }
 
 type Camera struct {
-	Make             string
-	Model            string
-	Type             CameraType
-	FixedLens        *Lens
-	CompatibleLenses []Lens
+	Make             string     `yaml:"make"`
+	Model            string     `yaml:"model"`
+	Type             CameraType `yaml:"type"`
+	FixedLens        *Lens      `yaml:"fixedlens,omitempty"`
+	CompatibleLenses []Lens     `yaml:"compatiblelenses,omitempty"`
 }
 
 type FilmStock struct {
-	Name   string
-	ISO    int
-	Format string
+	Name   string `yaml:"name"`
+	ISO    int    `yaml:"iso"`
+	Format string `yaml:"format"`
 }
 
 type CLIFlags struct {
@@ -53,7 +53,6 @@ type CLIFlags struct {
 }
 
 // YAML config structures
-
 type GearConfig struct {
 	Cameras    map[string]Camera `yaml:"cameras"`
 	FilmStocks []FilmStock       `yaml:"filmstocks"`
@@ -86,9 +85,10 @@ func loadGearConfig() (GearConfig, error) {
 	}
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		// Write default config
+		fmt.Println("No config found, creating default at:", path)
 		defaultConfig := GearConfig{
-			Cameras:    cameras,
-			FilmStocks: filmStocks,
+			Cameras:    defaultCameras,
+			FilmStocks: defaultFilmStocks,
 		}
 		data, err := yaml.Marshal(defaultConfig)
 		if err != nil {
@@ -125,8 +125,8 @@ func saveGearConfig(config GearConfig) error {
 	return os.WriteFile(path, data, 0644)
 }
 
-// Predefined camera database
-var cameras = map[string]Camera{
+// Default camera database (for first run)
+var defaultCameras = map[string]Camera{
 	"Contax T3": {
 		Make:  "Contax",
 		Model: "T3",
@@ -168,7 +168,7 @@ var cameras = map[string]Camera{
 	},
 }
 
-var filmStocks = []FilmStock{
+var defaultFilmStocks = []FilmStock{
 	{Name: "Cinestill 50D", ISO: 50, Format: "35mm"},
 	{Name: "Cinestill 800T", ISO: 800, Format: "35mm"},
 	{Name: "Kodak Portra 400", ISO: 400, Format: "35mm"},
@@ -279,14 +279,14 @@ func selectCamera() (Camera, error) {
 		cameraKeys = append(cameraKeys, k)
 	}
 	// Add manual entry option
-	manualEntry := Camera{Make: "", Model: "", Type: Fixed}
+	manualEntry := Camera{Make: "Manual Entry", Model: ""}
 	cameraList = append(cameraList, manualEntry)
 
 	idx, err := fuzzyfinder.Find(
 		cameraList,
 		func(i int) string {
 			c := cameraList[i]
-			if c.Make == "" && c.Model == "" {
+			if c.Make == "Manual Entry" {
 				return "Other (manual entry)"
 			}
 			if c.Type == Fixed && c.FixedLens != nil {
@@ -313,8 +313,8 @@ func selectCamera() (Camera, error) {
 		if err := survey.AskOne(modelPrompt, &model); err != nil {
 			return Camera{}, err
 		}
-		newCamera := Camera{Make: make, Model: model, Type: Fixed}
-		gearConfig.Cameras[model] = newCamera
+		newCamera := Camera{Make: make, Model: model, Type: Fixed} // Default to fixed, user can edit YAML
+		gearConfig.Cameras[make+" "+model] = newCamera
 		saveGearConfig(gearConfig)
 		return newCamera, nil
 	}
@@ -326,13 +326,13 @@ func selectLens(camera Camera) (Lens, error) {
 		return *camera.FixedLens, nil
 	}
 	lenses := camera.CompatibleLenses
-	manualLens := Lens{Name: "", FocalLength: 0, MaxAperture: 0}
+	manualLens := Lens{Name: "Manual Entry"}
 	lenses = append(lenses, manualLens)
 	idx, err := fuzzyfinder.Find(
 		lenses,
 		func(i int) string {
 			l := lenses[i]
-			if l.Name == "" {
+			if l.Name == "Manual Entry" {
 				return "Manual entry"
 			}
 			return fmt.Sprintf("%s (%dmm f/%.1f)", l.Name, l.FocalLength, l.MaxAperture)
@@ -368,13 +368,14 @@ func selectLens(camera Camera) (Lens, error) {
 			return Lens{}, fmt.Errorf("invalid aperture: %s", apertureStr)
 		}
 		newLens := Lens{Name: lensName, FocalLength: focalLength, MaxAperture: maxAperture}
-		for k, v := range gearConfig.Cameras {
-			if v.Model == camera.Model {
-				v.CompatibleLenses = append(v.CompatibleLenses, newLens)
-				gearConfig.Cameras[k] = v
-				break
-			}
+		
+		// Find the camera in the config and add the new lens
+		cameraKey := camera.Make + " " + camera.Model
+		if cam, ok := gearConfig.Cameras[cameraKey]; ok {
+			cam.CompatibleLenses = append(cam.CompatibleLenses, newLens)
+			gearConfig.Cameras[cameraKey] = cam
 		}
+		
 		saveGearConfig(gearConfig)
 		return newLens, nil
 	}
@@ -392,14 +393,14 @@ func selectFilmStock(camera Camera) (FilmStock, error) {
 			filtered = append(filtered, film)
 		}
 	}
-	manualFilm := FilmStock{Name: "", ISO: 0, Format: format}
+	manualFilm := FilmStock{Name: "Manual Entry", Format: format}
 	filtered = append(filtered, manualFilm)
 	idx, err := fuzzyfinder.Find(
 		filtered,
 		func(i int) string {
 			f := filtered[i]
-			if f.Name == "" {
-				return "Manual entry"
+			if f.Name == "Manual Entry" {
+				return "Other (manual entry)"
 			}
 			return fmt.Sprintf("%s (ISO %d, %s)", f.Name, f.ISO, f.Format)
 		},
@@ -457,14 +458,14 @@ func confirmConfiguration(camera Camera, lens Lens, film FilmStock, fileCount in
 
 // Flag-based functions
 func findCameraByName(name string) (Camera, error) {
-	if camera, exists := cameras[name]; exists {
+	if camera, exists := gearConfig.Cameras[name]; exists {
 		return camera, nil
 	}
 	return Camera{}, fmt.Errorf("camera not found: %s", name)
 }
 
 func findLensByName(camera Camera, name string) (Lens, error) {
-	if camera.Type == Fixed {
+	if camera.Type == Fixed && camera.FixedLens != nil {
 		return *camera.FixedLens, nil
 	}
 
@@ -477,7 +478,7 @@ func findLensByName(camera Camera, name string) (Lens, error) {
 }
 
 func findFilmByName(name string, format string) (FilmStock, error) {
-	for _, film := range filmStocks {
+	for _, film := range gearConfig.FilmStocks {
 		if film.Name == name && film.Format == format {
 			return film, nil
 		}
@@ -590,7 +591,7 @@ func runCleanMode(path string) error {
 
 	var confirm bool
 	prompt := &survey.Confirm{
-		Message: "⚠️  This will remove scanner make/model, f-stop, shutter speed, and ISO. Continue?",
+		Message: "⚠️  This will remove all metadata except the color profile. Continue?",
 		Default: false,
 	}
 	if err := survey.AskOne(prompt, &confirm); err != nil {
@@ -630,6 +631,14 @@ func main() {
 		fmt.Printf("❌ Environment check failed: %v\n", err)
 		os.Exit(1)
 	}
+	
+	var err error
+	gearConfig, err = loadGearConfig()
+	if err != nil {
+		fmt.Printf("❌ Failed to load gear configuration: %v\n", err)
+		os.Exit(1)
+	}
+
 
 	var flags CLIFlags
 
