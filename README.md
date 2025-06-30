@@ -26,11 +26,10 @@ FilmTag solves this by:
 go install github.com/rohanpandula/filmtag@latest
 ```
 
-### Via Homebrew (Coming Soon)
-Homebrew support is planned for a future release.
+### After installation, ensure `filmtag` is in your PATH:
 ```bash
-# brew tap rohanpandula/filmtag
-# brew install filmtag
+echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> ~/.bashrc
+source ~/.bashrc
 ```
 
 ## Usage
